@@ -91,6 +91,10 @@ client.plist
 # misc
 .DS_Store
 
+# AI tool local files
+CLAUDE.md
+.beads/
+
 # Visual Studio Code Workspace Files
 *.vscode
 *.userprefs
