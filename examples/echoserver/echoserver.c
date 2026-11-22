@@ -531,6 +531,19 @@ static int wolfSSH_FwdDefaultActions(WS_FwdCbAction action, void* vCtx,
             ret = -1;
         }
 
+    #ifndef USE_WINDOWS_API
+        if (ret == 0) {
+            /* A forward torn down with a connection open leaves this port in
+             * TIME_WAIT, which would fail the next bind. tcp_listen() sets
+             * this for the other listeners; do the same here. */
+            int on = 1;
+            if (setsockopt(appCtx->listenFd, SOL_SOCKET, SO_REUSEADDR,
+                    &on, (socklen_t)sizeof(on)) < 0) {
+                ret = -1;
+            }
+        }
+    #endif
+
         if (ret == 0) {
 
             WMEMSET(&addr, 0, sizeof addr);
@@ -873,7 +886,6 @@ static int ssh_worker(thread_ctx_t* threadCtx)
 #endif
 #ifdef WOLFSSH_FWD
         WS_SOCKET_T fwdFd = -1;
-        WS_SOCKET_T fwdListenFd = threadCtx->fwdCtx.listenFd;
         word32 fwdBufferIdx = 0;
 #endif
 
@@ -955,10 +967,13 @@ static int ssh_worker(thread_ctx_t* threadCtx)
             }
             #endif /* WOLFSSH_AGENT */
             #ifdef WOLFSSH_FWD
-            if (threadCtx->fwdCtx.state == APP_STATE_LISTEN) {
-                FD_SET(fwdListenFd, &readFds);
-                if (fwdListenFd > maxFd)
-                    maxFd = fwdListenFd;
+            /* The fwd callback creates this listener mid-loop; re-read it
+             * each pass rather than caching it. */
+            if (threadCtx->fwdCtx.state == APP_STATE_LISTEN
+                    && threadCtx->fwdCtx.listenFd >= 0) {
+                FD_SET(threadCtx->fwdCtx.listenFd, &readFds);
+                if (threadCtx->fwdCtx.listenFd > maxFd)
+                    maxFd = threadCtx->fwdCtx.listenFd;
             }
             if (fwdFd >= 0
                     && threadCtx->fwdCtx.state == APP_STATE_CONNECTED) {
@@ -1250,12 +1265,13 @@ static int ssh_worker(thread_ctx_t* threadCtx)
                     }
                 }
             }
-            if (threadCtx->fwdCtx.state == APP_STATE_LISTEN) {
-                if (FD_ISSET(fwdListenFd, &readFds)) {
+            if (threadCtx->fwdCtx.state == APP_STATE_LISTEN
+                    && threadCtx->fwdCtx.listenFd >= 0) {
+                if (FD_ISSET(threadCtx->fwdCtx.listenFd, &readFds)) {
                     #ifdef SHELL_DEBUG
                         printf("accepting fwd connection\n");
                     #endif
-                    fwdFd = accept(fwdListenFd, NULL, NULL);
+                    fwdFd = accept(threadCtx->fwdCtx.listenFd, NULL, NULL);
                     if (fwdFd == -1) {
                         rc = errno;
                         if (rc != SOCKET_EWOULDBLOCK) {
@@ -2249,6 +2265,11 @@ static int LoadPasswdList(StrList* strList, PwMapList* mapList)
     int count = 0;
 
     while (strList) {
+        if (WSTRLEN(strList->str) >= sizeof names - 1) {
+            fprintf(stderr, "Ignoring over-long entry: %.32s\n", strList->str);
+            strList = strList->next;
+            continue;
+        }
         WSTRNCPY(names, strList->str, sizeof names - 1);
         passwd = WSTRCHR(names, ':');
         if (passwd != NULL) {
@@ -2278,6 +2299,11 @@ static int LoadKeyboardList(StrList* strList, PwMapList* mapList,
     int count = 0;
 
     while (strList) {
+        if (WSTRLEN(strList->str) >= sizeof names - 1) {
+            fprintf(stderr, "Ignoring over-long entry: %.32s\n", strList->str);
+            strList = strList->next;
+            continue;
+        }
         WSTRNCPY(names, strList->str, sizeof names - 1);
         passwd = WSTRCHR(names, ':');
         if (passwd != NULL) {
@@ -2314,6 +2340,11 @@ static int LoadPubKeyList(StrList* strList, int format, PwMapList* mapList)
         buf = NULL;
         bufSz = 0;
 
+        if (WSTRLEN(strList->str) >= sizeof names - 1) {
+            fprintf(stderr, "Ignoring over-long entry: %.32s\n", strList->str);
+            strList = strList->next;
+            continue;
+        }
         WSTRNCPY(names, strList->str, sizeof names - 1);
         fileName = WSTRCHR(names, ':');
         if (fileName != NULL) {
@@ -2834,6 +2865,12 @@ static INLINE void SignalTcpReady(tcp_ready* ready, word16 port)
     ready->port = port;
     pthread_cond_signal(&ready->cond);
     pthread_mutex_unlock(&ready->mutex);
+#elif defined(USE_WINDOWS_API) && defined(NO_MAIN_DRIVER) && \
+    !defined(SINGLE_THREADED)
+    ready->ready = 1;
+    ready->port = port;
+    /* SetEvent is a full barrier; this one-shot signal needs no lock */
+    SetEvent(ready->readyEvent);
 #else
     WOLFSSH_UNUSED(ready);
     WOLFSSH_UNUSED(port);
@@ -2979,7 +3016,7 @@ THREAD_RETURN WOLFSSH_THREAD echoserver_test(void* args)
                     }
                     else {
                         port = (word16)atoi(myoptarg);
-                        #if !defined(NO_MAIN_DRIVER) || defined(USE_WINDOWS_API)
+                        #if !defined(NO_MAIN_DRIVER)
                             if (port == 0) {
                                 ES_ERROR("port number cannot be 0");
                             }

@@ -104,6 +104,14 @@ WOLFSSH_API int wolfSSH_ReadKey_file(const char* name,
         byte** out, word32* outSz, const byte** outType, word32* outTypeSz,
         byte* isPrivate, void* heap);
 
+/* SetAlgoList* validate the list, returning WS_SUCCESS, WS_INVALID_ALGO_ID for
+ * a bad list, or WS_SSH_CTX_NULL_E / WS_SSH_NULL_E for a NULL ctx / ssh.
+ * Kex/Cipher/Mac reject NULL. Key accepts NULL only on a server, restoring the
+ * default of deriving the host key list from the loaded private keys; a client
+ * has no such fallback. KeyAccepted accepts NULL on either side, but that
+ * empties the list rather than restoring a default: the server then advertises
+ * an empty RFC 8308 "server-sig-algs", telling clients it accepts no signature
+ * algorithms, which stops OpenSSH clients offering rsa-sha2-256/512. */
 WOLFSSH_API int wolfSSH_CTX_SetAlgoListKex(WOLFSSH_CTX* ctx, const char* list);
 WOLFSSH_API const char* wolfSSH_CTX_GetAlgoListKex(WOLFSSH_CTX* ctx);
 WOLFSSH_API int wolfSSH_SetAlgoListKex(WOLFSSH* ssh, const char* list);
@@ -245,6 +253,10 @@ DEPRECATED WOLFSSH_API int wolfSSH_ChannelSetFwdFd(WOLFSSH_CHANNEL* channel,
         int fwdFd);
 DEPRECATED WOLFSSH_API int wolfSSH_ChannelGetFwdFd(
         const WOLFSSH_CHANNEL* channel);
+WOLFSSH_API int wolfSSH_FwdRemoteSetup(WOLFSSH* ssh, const char* bindAddr,
+        word32 bindPort, int wantReply);
+WOLFSSH_API int wolfSSH_FwdRemoteCancel(WOLFSSH* ssh, const char* bindAddr,
+        word32 bindPort, int wantReply);
 
 WOLFSSH_API int wolfSSH_ChannelFree(WOLFSSH_CHANNEL* channel);
 WOLFSSH_API int wolfSSH_ChannelGetId(WOLFSSH_CHANNEL* channel, word32* id,
@@ -257,6 +269,13 @@ WOLFSSH_API int wolfSSH_ChannelRead(WOLFSSH_CHANNEL* channel, byte* buf,
         word32 bufSz);
 WOLFSSH_API int wolfSSH_ChannelSend(WOLFSSH_CHANNEL* channel, const byte* buf,
         word32 bufSz);
+/* The Ext variants carry extended data (stderr) rather than normal data. See
+ * wolfSSH_extended_data_read() below for the drain contract; these read and
+ * write the named channel instead of the first one in the channel list. */
+WOLFSSH_API int wolfSSH_ChannelReadExt(WOLFSSH_CHANNEL* channel, byte* buf,
+        word32 bufSz);
+WOLFSSH_API int wolfSSH_ChannelSendExt(WOLFSSH_CHANNEL* channel,
+        const byte* buf, word32 bufSz);
 WOLFSSH_API int wolfSSH_ChannelExit(WOLFSSH_CHANNEL* channel);
 WOLFSSH_API int wolfSSH_ChannelGetEof(WOLFSSH_CHANNEL* channel);
 WOLFSSH_API const char* wolfSSH_ChannelGetType(
@@ -384,6 +403,23 @@ typedef struct WS_UserAuthData_PublicKey {
     const byte* signature;
     word32 signatureSz;
     byte isCert:1;
+    word32 dataToSignSz; /* signed request length; 0 = derive from the fields */
+#ifdef WOLFSSH_OSSH_CERTS
+    /* Set while isOsshCert; the callback must trust-check caKey. Keep last so
+     * the members above hold their offsets in both builds. */
+    byte isOsshCert:1;
+    const byte* caKey;
+    word32 caKeySz;
+    const byte* principals;
+    word32 principalsSz;
+    word64 validAfter;  /* epoch seconds */
+    word64 validBefore;
+    /* NULL when absent; sourceAddress is a comma-separated CIDR list. */
+    const byte* forceCommand;
+    word32 forceCommandSz;
+    const byte* sourceAddress;
+    word32 sourceAddressSz;
+#endif /* WOLFSSH_OSSH_CERTS */
 } WS_UserAuthData_PublicKey;
 
 typedef struct WS_UserAuthData {
@@ -437,6 +473,19 @@ WOLFSSH_API char* wolfSSH_GetUsername(WOLFSSH* ssh);
 WOLFSSH_API int wolfSSH_CTX_SetBanner(WOLFSSH_CTX* ctx, const char* newBanner);
 WOLFSSH_API int wolfSSH_CTX_SetSshProtoIdStr(WOLFSSH_CTX* ctx,
         const char* protoIdStr);
+/* Set the server-side limit on failed userauth attempts per connection. The
+ * default is DEFAULT_MAX_AUTH_ATTEMPTS (6), the same value as the OpenSSH
+ * MaxAuthTries default. When the limit is reached the server sends an
+ * SSH_MSG_DISCONNECT and drops the connection. A value <= 0 restores the
+ * built-in default; there is no "unlimited" setting. Every request that does
+ * not fully authenticate is charged, including a partial success; only the
+ * opening "none" probe clients use to learn the method list is exempt.
+ * The WOLFSSH setter overrides the value inherited from the CTX for one
+ * session; the getters return the current value or WS_BAD_ARGUMENT. */
+WOLFSSH_API int wolfSSH_CTX_SetMaxAuthAttempts(WOLFSSH_CTX* ctx, int value);
+WOLFSSH_API int wolfSSH_CTX_GetMaxAuthAttempts(WOLFSSH_CTX* ctx);
+WOLFSSH_API int wolfSSH_SetMaxAuthAttempts(WOLFSSH* ssh, int value);
+WOLFSSH_API int wolfSSH_GetMaxAuthAttempts(WOLFSSH* ssh);
 WOLFSSH_API int wolfSSH_CTX_UsePrivateKey_buffer(WOLFSSH_CTX* ctx,
                                                  const byte* in, word32 inSz,
                                                  int format);
@@ -457,6 +506,32 @@ WOLFSSH_API int wolfSSH_stream_read(WOLFSSH* ssh, byte* buf, word32 bufSz);
 WOLFSSH_API int wolfSSH_stream_send(WOLFSSH* ssh, byte* buf, word32 bufSz);
 WOLFSSH_API int wolfSSH_stream_exit(WOLFSSH* ssh, int status);
 WOLFSSH_API int wolfSSH_extended_data_send(WOLFSSH* ssh, byte* buf, word32 bufSz);
+/* Reads the buffered stderr of the first channel in the channel list into out;
+ * returns the number of bytes read (>= 0) or a negative WS_ error. outSz of 0
+ * is WS_BAD_ARGUMENT. This is the stderr counterpart of wolfSSH_stream_read(),
+ * and reads the same channel it does.
+ *
+ * Apps MUST drain stderr: it shares the channel receive window with stdout
+ * (RFC 4254 5.2) and the window is only replenished here, so unread stderr
+ * eventually stalls the channel. Call after wolfSSH_stream_read() returns
+ * WS_EXTDATA, until this returns 0.
+ *
+ * A session with more than one open channel cannot be served by this pair:
+ * wolfSSH_stream_read() reports data, normal or extended, only for the first
+ * channel and fails with WS_ERROR on anything else. Read those channels with
+ * wolfSSH_ChannelIdRead() and wolfSSH_ChannelIdReadExt(), which name the
+ * channel, and drain each one's stderr for the same reason;
+ * wolfSSH_worker() names the channel the extended data arrived on when it
+ * returns WS_EXTDATA.
+ *
+ * Draining sends the peer a window adjust. On a non-blocking socket that send
+ * can be short: the byte count is still returned, but wolfSSH_get_error() is
+ * left at WS_WANT_WRITE to show a flush is owed. An app that only reads must
+ * then flush, with wolfSSH_worker(), or the peer's window is never replenished
+ * and the channel stalls.
+ *
+ * The buffer lives on the channel: anything unread when the channel is removed
+ * (the peer's CHANNEL_CLOSE) is discarded with it. */
 WOLFSSH_API int wolfSSH_extended_data_read(WOLFSSH* ssh, byte* out,
         word32 outSz);
 WOLFSSH_API int wolfSSH_TriggerKeyExchange(WOLFSSH* ssh);
@@ -467,6 +542,10 @@ WOLFSSH_API int wolfSSH_global_request(WOLFSSH* ssh, const unsigned char* data,
 WOLFSSH_API int wolfSSH_ChannelIdRead(WOLFSSH* ssh, word32 channelId,
         byte* buf, word32 bufSz);
 WOLFSSH_API int wolfSSH_ChannelIdSend(WOLFSSH* ssh, word32 channelId,
+        byte* buf, word32 bufSz);
+WOLFSSH_API int wolfSSH_ChannelIdReadExt(WOLFSSH* ssh, word32 channelId,
+        byte* buf, word32 bufSz);
+WOLFSSH_API int wolfSSH_ChannelIdSendExt(WOLFSSH* ssh, word32 channelId,
         byte* buf, word32 bufSz);
 
 WOLFSSH_API void wolfSSH_GetStats(WOLFSSH* ssh,

@@ -40,7 +40,6 @@
 #include <wolfssh/log.h>
 
 #include <errno.h>
-#include <stdint.h>
 
 
 #ifdef NO_INLINE
@@ -77,19 +76,24 @@ static void LogScpStateError(const char* state, int ret)
 }
 
 
+/* Drain all buffered stderr, not just the first msg-sized chunk: the window is
+ * only credited for bytes read, so a residue strands that credit and stalls the
+ * channel. A blob can be maxPacketSz (32KB). */
 static int _DumpExtendedData(WOLFSSH* ssh)
 {
     byte msg[WOLFSSH_DEFAULT_EXTDATA_SZ];
     int msgSz;
 
-    msgSz = wolfSSH_extended_data_read(ssh, msg, WOLFSSH_DEFAULT_EXTDATA_SZ-1);
-    if (msgSz > 0) {
-        msg[msgSz] = 0;
-        fprintf(stderr, "%s", msg);
-        msgSz = WS_SUCCESS;
-    }
+    do {
+        msgSz = wolfSSH_extended_data_read(ssh, msg,
+                WOLFSSH_DEFAULT_EXTDATA_SZ - 1);
+        if (msgSz > 0) {
+            msg[msgSz] = 0;
+            fprintf(stderr, "%s", msg);
+        }
+    } while (msgSz > 0);
 
-    return msgSz;
+    return (msgSz < 0) ? msgSz : WS_SUCCESS;
 }
 
 
@@ -1071,6 +1075,54 @@ static int FindSpaceInString(byte* buf, word32 bufSz, word32* inOutIdx)
     return WS_SUCCESS;
 }
 
+/* Parse a base-10 unsigned integer from an SCP header field of exactly
+ * len bytes. Every byte must be a digit, so a signed field such as "-1"
+ * or "+1" and any leading whitespace are rejected rather than parsed.
+ * Values above max are rejected instead of wrapping.
+ *
+ * Hand-rolled rather than using strtoull(), which is C99 and so is not
+ * available on every port, and which would accept the signed and
+ * whitespace-padded forms above.
+ *
+ * str      - start of the field
+ * len      - field length, up to but not including the separator
+ * max      - largest accepted value
+ * out      - [OUT] parsed value, untouched on failure
+ *
+ * returns WS_SUCCESS on success, WS_BAD_ARGUMENT if str or out is NULL,
+ * WS_SCP_BAD_MSG_E on a malformed or out-of-range field
+ */
+static int ScpParseUInt64(const char* str, word32 len, word64 max,
+                          word64* out)
+{
+    word64 val = 0;
+    word32 i;
+
+    if (str == NULL || out == NULL)
+        return WS_BAD_ARGUMENT;
+
+    if (len == 0)
+        return WS_SCP_BAD_MSG_E;
+
+    for (i = 0; i < len; i++) {
+        word64 d;
+
+        if (str[i] < '0' || str[i] > '9')
+            return WS_SCP_BAD_MSG_E;
+
+        /* check d against max first so the subtraction cannot underflow */
+        d = (word64)(str[i] - '0');
+        if (d > max || val > (max - d) / 10)
+            return WS_SCP_BAD_MSG_E;
+
+        val = val * 10 + d;
+    }
+
+    *out = val;
+    return WS_SUCCESS;
+}
+
+
 /* Reads file size from beginning of string, expects space to be after,
  * places size in ssh->scpFileSz.
  *
@@ -1096,26 +1148,14 @@ static int GetScpFileSize(WOLFSSH* ssh, byte* buf, word32 bufSz,
         ret = WS_SCP_BAD_MSG_E;
 
     if (ret == WS_SUCCESS) {
-        /* replace space with newline to terminate the size field, then parse
-         * with strtoull() which parses in 64-bit width, so a negative field
-         * such as "-1" wraps above UINT32_MAX and is rejected by the bound
-         * below instead of becoming a huge word32 size */
-        char* endptr = NULL;
-        word64 fileSz;
+        /* the size field runs from idx up to the separating space; bound it
+         * to 0xFFFFFFFF to fit the word32 scpFileSz */
+        word64 fileSz = 0;
 
-        buf[spaceIdx] = '\n';
-        errno = 0;
-        fileSz = (word64)strtoull((char*)(buf + idx), &endptr, 10);
-        buf[spaceIdx] = ' ';
+        ret = ScpParseUInt64((const char*)(buf + idx), spaceIdx - idx,
+                             0xFFFFFFFFUL, &fileSz);
 
-        /* reject any parse error (e.g. ERANGE overflow), a non-numeric field
-         * (parse must consume every character up to the separator), and
-         * sizes too large for the word32 scpFileSz */
-        if (errno != 0 || endptr != (char*)(buf + spaceIdx) ||
-            fileSz > UINT32_MAX) {
-            ret = WS_SCP_BAD_MSG_E;
-        }
-        else {
+        if (ret == WS_SUCCESS) {
             ssh->scpFileSz = (word32)fileSz;
 
             /* increment idx to space, then eat trailing space */
@@ -1244,17 +1284,12 @@ static int GetScpTimestamp(WOLFSSH* ssh, byte* buf, word32 bufSz,
 
     /* read modification time */
     if (ret == WS_SUCCESS) {
-        char* endptr = NULL;
-
-        /* replace space with newline to terminate the field */
-        buf[spaceIdx] = '\n';
-        errno = 0;
-        ssh->scpMTime = (word64)strtoull((char*)(buf + idx), &endptr, 10);
-        buf[spaceIdx] = ' ';
-
-        /* reject any parse error (e.g. ERANGE overflow) and a non-numeric
-         * field, then step past the separating space */
-        if (errno != 0 || endptr != (char*)(buf + spaceIdx)) {
+        /* the field runs from idx up to the separating space, then step past
+         * that space; report the timestamp error rather than the bad message
+         * error the parser returns */
+        if (ScpParseUInt64((const char*)(buf + idx), spaceIdx - idx,
+                           W64LIT(0xFFFFFFFFFFFFFFFF),
+                           &ssh->scpMTime) != WS_SUCCESS) {
             ret = WS_SCP_TIMESTAMP_E;
         }
         else if (spaceIdx + 1 < bufSz) {
@@ -1291,15 +1326,9 @@ static int GetScpTimestamp(WOLFSSH* ssh, byte* buf, word32 bufSz,
     }
 
     if (ret == WS_SUCCESS) {
-        char* endptr = NULL;
-        /* replace space with newline for strtoull */
-        buf[spaceIdx] = '\n';
-        errno = 0;
-        ssh->scpATime = (word64)strtoull((char*)(buf + idx), &endptr, 10);
-        /* restore space, increment idx past it */
-        buf[spaceIdx] = ' ';
-
-        if (errno != 0 || endptr != (char*)(buf + spaceIdx)) {
+        if (ScpParseUInt64((const char*)(buf + idx), spaceIdx - idx,
+                           W64LIT(0xFFFFFFFFFFFFFFFF),
+                           &ssh->scpATime) != WS_SUCCESS) {
             ret = WS_SCP_TIMESTAMP_E;
         }
         else if (spaceIdx + 1 < bufSz) {
@@ -1952,12 +1981,19 @@ int wolfSSH_SCP_connect(WOLFSSH* ssh, byte* cmd)
 }
 
 
+/* Shared format so the size probe and the write cannot drift. */
+#define SCP_CMD_FMT "scp -%c %s"
+
 static char* MakeScpCmd(const char* name, char dir, void* heap)
 {
     char* cmd;
     int sz;
 
-    sz = WSNPRINTF(NULL, 0, "scp -%c %s", dir, name) + 1;
+#ifdef USE_WINDOWS_API
+    sz = WSCPRINTF(SCP_CMD_FMT, dir, name) + 1;
+#else
+    sz = WSNPRINTF(NULL, 0, SCP_CMD_FMT, dir, name) + 1;
+#endif
     if (sz <= 0) {
         return NULL;
     }
@@ -1965,7 +2001,7 @@ static char* MakeScpCmd(const char* name, char dir, void* heap)
     if (cmd == NULL) {
         return NULL;
     }
-    sz = WSNPRINTF(cmd, sz, "scp -%c %s", dir, name);
+    sz = WSNPRINTF(cmd, sz, SCP_CMD_FMT, dir, name);
     if (sz <= 0) {
         WFREE(cmd, heap, DYNTYPE_STRING);
         return NULL;
@@ -2717,9 +2753,14 @@ static ScpDir* ScpNewDir(void *fs, const char* path, void* heap)
 int ScpPushDir(void *fs, ScpSendCtx* ctx, const char* path, void* heap)
 {
     ScpDir* entry;
+    word32  pathSz;
 
     if (ctx == NULL || path == NULL)
         return WS_BAD_ARGUMENT;
+
+    pathSz = (word32)WSTRLEN(path);
+    if (pathSz >= sizeof(ctx->dirName))
+        return WS_BUFFER_E;
 
     entry = ScpNewDir(fs, path, heap);
     if (entry == NULL) {
@@ -2734,12 +2775,27 @@ int ScpPushDir(void *fs, ScpSendCtx* ctx, const char* path, void* heap)
         ctx->currentDir = entry;
     }
 
-    /* append directory name to ctx->dirName */
-    WSTRNCPY(ctx->dirName, path, DEFAULT_SCP_FILE_NAME_SZ-1);
-    ctx->dirName[DEFAULT_SCP_FILE_NAME_SZ-1] = '\0';
+    /* append directory name to ctx->dirName, terminator included; the guard
+     * above bounds pathSz so the copy always fits */
+    WMEMCPY(ctx->dirName, path, pathSz + 1);
 
     return WS_SUCCESS;
 }
+
+#ifdef WOLFSSH_TEST_INTERNAL
+int wolfSSH_TestScpPushDir(const char* path)
+{
+    ScpSendCtx ctx;
+    int ret;
+
+    WMEMSET(&ctx, 0, sizeof(ctx));
+    ret = ScpPushDir(NULL, &ctx, path, NULL);
+    if (ret == WS_SUCCESS)
+        ScpSendCtxFreeDirs(NULL, &ctx, NULL);
+
+    return ret;
+}
+#endif /* WOLFSSH_TEST_INTERNAL */
 
 /* Remove top ScpDir from directory stack, remove dir from ctx->dirName */
 int ScpPopDir(void *fs, ScpSendCtx* ctx, void* heap)
